@@ -39,7 +39,11 @@ cd f:\projects\VS_code\Oracle
 > （用完记得删掉那个文件）。
 
 脚本跑完会打印仓库/Actions 页面链接，并自动 `workflow_dispatch` 触发一次验证。
-核对页面：`https://github.com/<你>/oci-grab-cloud/settings/secrets/actions`
+核对页面：`https://github.com/<你>/<仓库名>/settings/secrets/actions`
+
+> **本次实际产出的仓库是 `Tranqmanor/oci-arm-grab`（公开）**，用命令：
+> `.\setup-grab-repo.ps1 -Repo oci-arm-grab -Public -VarsToSecrets -DeleteVars`
+> 本地目录名 `oci-grab-cloud\` 只是脚本的「载荷目录」，与线上仓库名无关。
 
 ## 1.5 公开仓库模式（推荐：不占 Actions 分钟数）
 
@@ -140,16 +144,22 @@ Actions → *oci-arm-grab* → **Run workflow**。看日志：
 
 ## 6. 注意事项 / 限制
 
-- **认证私钥放 GitHub Secrets**：私有仓库 + Secrets 是常规做法，但仍等于把钥匙交给
-  GitHub。抢完可以把这个 API key 在控制台 API keys 里 **删除/换新**（一分钟的事），
+- **认证私钥放 GitHub Secrets**：等于把钥匙交给 GitHub（公开仓库也一样，fork 的 PR
+  默认拿不到 Secrets）。抢完可以把这个 API key 在控制台 API keys 里 **删除/换新**（一分钟的事），
   或者用一条只授予 `use-compute-instance` 相关权限的独立 IAM 用户来生成 key。
 - cron 实际触发可能延迟几分钟（GitHub 高峰期），15 分钟一轮足够覆盖释放窗口。
 - 想更密：把 `cron` 改成 `'*/5 * * * *'`（5 分钟一轮），job 内部连续跑 10 分钟，
   并发组 `arm-grab` 会防止重叠。
-- Free 计划私有仓库每月 2000 分钟 Actions；15 分钟一轮 ≈ 每月 ~1000 分钟，够用，
-  但会占掉一半额度。想省：把单次 `timeout 600s` 调小（比如 240s）。
+- **分钟数**：私有仓库每月 2000 分钟，15 分钟一轮 ≈ 每月 ~1000 分钟，够用但占一半；
+  **公开仓库的 GitHub-hosted Linux runner 不计分钟数**（本仓库当前就是公开模式）。
+  想省：把单次 `timeout 600s` 调小（比如 240s）。
 - GitHub runner 出口 IP 是微软 Azure 段的（美国），API 调用没问题；真正建实例也是
   在你自己 tenancy 里，不受影响。
+- **本机也在跑同一条轮询**（`.\arm.ps1 grab-bg`）时，两个轮询器会一起打
+  `LaunchInstance`，偶尔撞 `TooManyRequests`（可重试，不影响）；想避免就只留一条。
+- **自检小坑**：`$GITHUB_PATH` 只对后续步骤生效，当前步骤里 `oci` 不在 PATH，
+  必须用绝对路径 `"$HOME/oci-venv/bin/oci"`；`bash -e` 下 `timeout` 返回 143
+  会被当成失败，脚本里已用 `set +e` + 自己判退出码解决。
 
 ## 7. 不想用 GitHub 的另外两条路
 
