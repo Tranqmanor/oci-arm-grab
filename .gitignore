@@ -1,0 +1,8 @@
+# 这个仓库只放 workflow + 文档。任何密钥/本地配置都不要放进来。
+*.pem
+*.key
+.env
+*.env
+!*.env.example
+oci_api_key*
+.DS_Store

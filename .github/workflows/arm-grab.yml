@@ -1,0 +1,181 @@
+name: oci-arm-grab
+
+# 电脑关机也能抢：让 GitHub 的免费 runner 每 15 分钟替你轮询一次 Oracle。
+# 单次 job 内部还会连续重试（RETRY_INTERVAL 默认 60 秒，约 11 分钟），
+# 相当于全天候无死角轮询。抢到实例后自动把引导卷扩到 BOOT_VOLUME_SIZE_GB。
+on:
+  schedule:
+    - cron: '*/15 * * * *'
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: arm-grab
+  cancel-in-progress: false
+
+jobs:
+  grab:
+    runs-on: ubuntu-latest
+    timeout-minutes: 14
+    env:
+      COMPARTMENT_ID: ${{ vars.COMPARTMENT_ID || secrets.COMPARTMENT_ID }}
+      AVAILABILITY_DOMAIN: ${{ vars.AVAILABILITY_DOMAIN || secrets.AVAILABILITY_DOMAIN }}
+      SUBNET_ID: ${{ vars.SUBNET_ID || secrets.SUBNET_ID }}
+      IMAGE_ID: ${{ vars.IMAGE_ID || secrets.IMAGE_ID }}
+      OCPUS: ${{ vars.OCPUS || secrets.OCPUS }}
+      MEMORY_GB: ${{ vars.MEMORY_GB || secrets.MEMORY_GB }}
+      DISPLAY_NAME: ${{ vars.DISPLAY_NAME || secrets.DISPLAY_NAME }}
+      BOOT_VOLUME_SIZE_GB: ${{ vars.BOOT_VOLUME_SIZE_GB || secrets.BOOT_VOLUME_SIZE_GB }}
+      BOOT_VOLUME_VPUS_PER_GB: ${{ vars.BOOT_VOLUME_VPUS_PER_GB || secrets.BOOT_VOLUME_VPUS_PER_GB }}
+      RETRY_INTERVAL: ${{ vars.RETRY_INTERVAL || secrets.RETRY_INTERVAL }}
+    steps:
+      - name: 缓存 oci-cli 虚拟环境（省 Actions 分钟数）
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cache/pip
+            ~/oci-venv
+          key: oci-cli-venv-${{ runner.os }}-v1
+          restore-keys: |
+            oci-cli-venv-${{ runner.os }}-
+
+      - name: 安装 OCI CLI
+        run: |
+          set -euo pipefail
+          # 缓存命中但解释器路径变了（runner 镜像升级）时 venv 会坏，所以真跑一次 --version 校验
+          if [ ! -x "$HOME/oci-venv/bin/oci" ] || ! "$HOME/oci-venv/bin/oci" --version >/dev/null 2>&1; then
+            rm -rf "$HOME/oci-venv"
+            python3 -m venv "$HOME/oci-venv"
+            "$HOME/oci-venv/bin/pip" install --quiet --upgrade pip oci-cli
+          fi
+          echo "$HOME/oci-venv/bin" >> "$GITHUB_PATH"
+          # 注意：$GITHUB_PATH 只对「后续步骤」生效，当前步骤里 oci 还没进 PATH → 用绝对路径自检
+          "$HOME/oci-venv/bin/oci" --version
+
+      - name: 写 ~/.oci/config 和公钥
+        env:
+          PEM: ${{ secrets.OCI_API_KEY_PEM }}
+          TENANCY: ${{ secrets.OCI_TENANCY_OCID }}
+          USER_OC: ${{ secrets.OCI_USER_OCID }}
+          FP: ${{ secrets.OCI_KEY_FINGERPRINT }}
+          REGION: ${{ vars.OCI_REGION || secrets.OCI_REGION }}
+          SSHPUB: ${{ secrets.ARM_SSH_PUB_KEY }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/.oci" "$HOME/.ssh"
+          printf '%s\n' "$PEM" > "$HOME/.oci/oci_api_key.pem"
+          chmod 600 "$HOME/.oci/oci_api_key.pem"
+          printf '%s\n' "$SSHPUB" > "$HOME/.ssh/oci_arm.pub"
+          {
+            echo '[DEFAULT]'
+            echo "user=$USER_OC"
+            echo "tenancy=$TENANCY"
+            echo "region=$REGION"
+            echo "key_file=$HOME/.oci/oci_api_key.pem"
+            echo "fingerprint=$FP"
+          } > "$HOME/.oci/config"
+          chmod 600 "$HOME/.oci/config"
+
+          echo "== 私钥自检（不打印内容，只看结构）=="
+          echo "首行: $(head -n 1 "$HOME/.oci/oci_api_key.pem")"
+          echo "末行: $(tail -n 1 "$HOME/.oci/oci_api_key.pem")"
+          echo "行数: $(wc -l < "$HOME/.oci/oci_api_key.pem")  字节: $(wc -c < "$HOME/.oci/oci_api_key.pem")"
+          python3 -c "import os;from cryptography.hazmat.primitives.serialization import load_pem_private_key;k=load_pem_private_key(open(os.path.expanduser('~/.oci/oci_api_key.pem'),'rb').read(),password=None);print('private key OK, bits =', k.key_size)"
+
+          echo "== 认证自检 =="
+          if ! oci iam availability-domain list --compartment-id "$TENANCY" --no-retry > "$RUNNER_TEMP/ad.json" 2> "$RUNNER_TEMP/ad.err"; then
+            echo "!! OCI 调用失败。当前 config（不含密钥内容）："
+            cat "$HOME/.oci/config"
+            echo "---- stderr ----"
+            cat "$RUNNER_TEMP/ad.err"
+            exit 1
+          fi
+          python3 -c "import json,os;p=os.environ['RUNNER_TEMP']+'/ad.json';raw=open(p).read().strip();d=json.loads(raw) if raw.startswith('{') else {};print('认证成功，AD =', ', '.join(x['name'] for x in d.get('data',[])) if d else '（返回体不是 JSON：' + raw[:200] + '）')"
+
+      - name: 已有 A1 实例就收工
+        id: precheck
+        run: |
+          set -uo pipefail
+          [ -n "${COMPARTMENT_ID:-}" ] || { echo "!! vars.COMPARTMENT_ID 是空的 → Settings → Actions → Variables 里补上"; exit 1; }
+          if ! oci compute instance list --compartment-id "$COMPARTMENT_ID" --all --no-retry > "$RUNNER_TEMP/inst.json" 2> "$RUNNER_TEMP/inst.err"; then
+            echo "!! 列实例失败："; cat "$RUNNER_TEMP/inst.err"; exit 1
+          fi
+          n=$(python3 -c "import json,os;p=os.environ['RUNNER_TEMP']+'/inst.json';raw=open(p).read().strip();d=json.loads(raw) if raw.startswith('{') else {'data':[]};print(sum(1 for i in d.get('data',[]) if str(i.get('shape','')).startswith('VM.Standard.A1')))")
+          echo "count=$n" >> "$GITHUB_OUTPUT"
+          echo "现有 A1 实例数：$n"
+
+      - name: 抢 ARM（oci-arm-catcher）
+        if: steps.precheck.outputs.count == '0'
+        run: |
+          set -uo pipefail
+          for v in COMPARTMENT_ID AVAILABILITY_DOMAIN SUBNET_ID IMAGE_ID; do
+            [ -n "${!v:-}" ] || { echo "!! $v 是空的 → 检查仓库 Settings → Actions → Variables/Secrets"; exit 1; }
+          done
+          git clone --depth 1 https://github.com/alexpua/oci-arm-catcher "$RUNNER_TEMP/catcher"
+          cd "$RUNNER_TEMP/catcher"
+          cat > .env <<EOF
+          COMPARTMENT_ID="$COMPARTMENT_ID"
+          DISPLAY_NAME="${DISPLAY_NAME:-arm-free-1}"
+          SSH_KEY_FILE="$HOME/.ssh/oci_arm.pub"
+          AVAILABILITY_DOMAIN="$AVAILABILITY_DOMAIN"
+          SUBNET_ID="$SUBNET_ID"
+          IMAGE_ID="$IMAGE_ID"
+          OCPUS="${OCPUS:-2}"
+          MEMORY_GB="${MEMORY_GB:-12}"
+          RETRY_INTERVAL="${RETRY_INTERVAL:-120}"
+          EOF
+          chmod +x oci-arm-catcher.sh
+          # 关键：GitHub 在 Linux 上默认用 `bash -e` 跑 run 块。timeout 到点发 SIGTERM
+          # 会让脚本以 143 退出，-e 会当场终止步骤（表现为 "Process completed with exit code 143"），
+          # 所以这里必须先 set +e，自己判断退出码。
+          set +e
+          timeout --preserve-status 600s ./oci-arm-catcher.sh 2>&1 | tee "$RUNNER_TEMP/run.log"
+          rc=${PIPESTATUS[0]}
+          echo "exit=$rc" >> "$GITHUB_OUTPUT"
+          # 0 = 抢到；124/143 = 被 timeout 掐断（说明还在等容量，正常）；其它 = 真错误，让这一步变红好排查
+          if [ "$rc" -ne 0 ] && [ "$rc" -ne 124 ] && [ "$rc" -ne 143 ]; then
+            echo "!! oci-arm-catcher 以退出码 $rc 结束 —— 多半是配置/权限问题而不是没容量。上面日志的最后 30 行："
+            tail -n 30 "$RUNNER_TEMP/run.log"
+            exit "$rc"
+          fi
+          echo "本轮结束（rc=$rc）。没抢到就等下一次 cron。"
+
+      - name: 抢到后把引导卷扩到指定大小 / 性能
+        if: steps.precheck.outputs.count == '0'
+        run: |
+          set -uo pipefail
+          set +e          # 本步骤里 oci 失败不算错误（只是还没抢到），别被 runner 的 bash -e 中断
+          sleep 5
+          INST=$(oci compute instance list --compartment-id "$COMPARTMENT_ID" --all --no-retry --output json 2>"$RUNNER_TEMP/fin.err" \
+                 | python3 -c 'import json,sys;raw=sys.stdin.read().strip();d=json.loads(raw) if raw.startswith("{") else {"data":[]};a=[i for i in d.get("data",[]) if str(i.get("shape","")).startswith("VM.Standard.A1")];print(a[0]["id"] if a else "")')
+          if [ -z "$INST" ]; then
+            echo "本轮没抢到（没有 A1 实例），下次 cron 再来。"
+            [ -s "$RUNNER_TEMP/fin.err" ] && { echo "---- oci stderr ----"; head -5 "$RUNNER_TEMP/fin.err"; }
+            exit 0
+          fi
+          echo "instance=$INST" >> "$GITHUB_STEP_SUMMARY"
+          BV=$(oci compute boot-volume-attachment list --compartment-id "$COMPARTMENT_ID" --instance-id "$INST" --no-retry --output json 2>>"$RUNNER_TEMP/fin.err" \
+               | python3 -c 'import json,sys;raw=sys.stdin.read().strip();d=json.loads(raw) if raw.startswith("{") else {"data":[]};print(d["data"][0]["boot-volume-id"] if d.get("data") else "")')
+          echo "boot_volume=$BV" >> "$GITHUB_STEP_SUMMARY"
+          if [ -n "$BV" ]; then
+            [ -n "${BOOT_VOLUME_SIZE_GB:-}" ]   && oci bv boot-volume update --boot-volume-id "$BV" --size-in-gbs "$BOOT_VOLUME_SIZE_GB" --force || true
+            [ -n "${BOOT_VOLUME_VPUS_PER_GB:-}" ] && oci bv boot-volume update --boot-volume-id "$BV" --vpus-per-gb "$BOOT_VOLUME_VPUS_PER_GB" --force || true
+          fi
+
+      - name: 抢到就推送通知（可选）
+        if: steps.precheck.outputs.count == '0' && always()
+        env:
+          SENDKEY: ${{ secrets.SERVERCHAN_KEY }}
+        run: |
+          set -uo pipefail
+          set +e          # 通知是 best-effort，任何失败都不该让整轮变红
+          # 只有真正出现 A1 实例才推送，避免容量不足时刷屏
+          n=$(oci compute instance list --compartment-id "$COMPARTMENT_ID" --all --no-retry --output json 2>/dev/null \
+              | python3 -c 'import json,sys;raw=sys.stdin.read().strip();d=json.loads(raw) if raw.startswith("{") else {"data":[]};print(sum(1 for i in d.get("data",[]) if str(i.get("shape","")).startswith("VM.Standard.A1")))' || echo 0)
+          if [ "$n" = "0" ]; then echo "还没抢到，不推送"; exit 0; fi
+          if [ -z "${SENDKEY:-}" ]; then echo "没配 SERVERCHAN_KEY，跳过微信推送"; exit 0; fi
+          curl -s -m 15 -X POST "https://sctapi.ftqq.com/$SENDKEY.send" \
+            -d "title=Oracle ARM 抢到了" \
+            --data-urlencode "desp=A1.Flex 实例已创建（$n 台）。去控制台/SSH 登录吧。区域 ap-singapore-1。"
