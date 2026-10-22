@@ -18,7 +18,9 @@ concurrency:
 jobs:
   grab:
     runs-on: ubuntu-latest
-    timeout-minutes: 14
+    # 780s 抓取窗口 + 装 CLI/扩卷/通知的余量 ≈ 850s，所以上限给到 20 分钟。
+    # 公开仓库的 hosted runner 不计分钟数，放宽不会增加费用。
+    timeout-minutes: 20
     env:
       COMPARTMENT_ID: ${{ vars.COMPARTMENT_ID || secrets.COMPARTMENT_ID }}
       AVAILABILITY_DOMAIN: ${{ vars.AVAILABILITY_DOMAIN || secrets.AVAILABILITY_DOMAIN }}
@@ -131,7 +133,10 @@ jobs:
           # 会让脚本以 143 退出，-e 会当场终止步骤（表现为 "Process completed with exit code 143"），
           # 所以这里必须先 set +e，自己判断退出码。
           set +e
-          timeout --preserve-status 600s ./oci-arm-catcher.sh 2>&1 | tee "$RUNNER_TEMP/run.log"
+          # 单轮 job 的总抓取窗口。timeout-minutes: 20 给到 1200s 上限，这里取 780s，
+          # 留出余量给后面的"扩引导卷 / 推送通知"步骤。
+          # 780s / RETRY_INTERVAL(120s) ≈ 6~7 次 launch 尝试，比原来的 600s 多 1~2 次。
+          timeout --preserve-status 780s ./oci-arm-catcher.sh 2>&1 | tee "$RUNNER_TEMP/run.log"
           rc=${PIPESTATUS[0]}
           echo "exit=$rc" >> "$GITHUB_OUTPUT"
           # 0 = 抢到；124/143 = 被 timeout 掐断（说明还在等容量，正常）；其它 = 真错误，让这一步变红好排查
