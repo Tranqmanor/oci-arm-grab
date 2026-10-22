@@ -1,8 +1,11 @@
 # 关机也能抢：GitHub Actions 版轮询器
 
-原理：GitHub 的免费 runner 每 15 分钟跑一次这个 workflow，每次 job 内部再用
-`oci-arm-catcher.sh` 连续重试约 10 分钟（`RETRY_INTERVAL` 默认 60 秒）。
+原理：GitHub 的免费 runner 按 cron（默认 `*/15`）跑这个 workflow，每次 job 内部再用
+`oci-arm-catcher.sh` 连续重试约 13 分钟（`RETRY_INTERVAL` 默认 120 秒）。
 你的电脑关不关机都不影响，抢到了还能用 Server酱 推微信。
+
+> ⚠️ GitHub 的 cron **不保证精确**，实测 `*/15` 的真实间隔可能是 2~5 小时。
+> 想真正提高命中率，请让本机 `.\arm.ps1 grab-bg` 和 GitHub 通道**同时跑**。
 
 ## 1. 全自动（推荐）：一条命令建私有仓库 + push + 配 Secrets/Variables
 
@@ -147,12 +150,17 @@ Actions → *oci-arm-grab* → **Run workflow**。看日志：
 - **认证私钥放 GitHub Secrets**：等于把钥匙交给 GitHub（公开仓库也一样，fork 的 PR
   默认拿不到 Secrets）。抢完可以把这个 API key 在控制台 API keys 里 **删除/换新**（一分钟的事），
   或者用一条只授予 `use-compute-instance` 相关权限的独立 IAM 用户来生成 key。
-- cron 实际触发可能延迟几分钟（GitHub 高峰期），15 分钟一轮足够覆盖释放窗口。
-- 想更密：把 `cron` 改成 `'*/5 * * * *'`（5 分钟一轮），job 内部连续跑 10 分钟，
-  并发组 `arm-grab` 会防止重叠。
+- cron 实际触发可能延迟几分钟到**几小时**（GitHub 调度器高峰期会合并/延迟 schedule，
+  官方不保证精确性）。本仓库实测 `*/15` 的真实间隔在 **2~5 小时**，
+  所以**不能只依赖 GitHub 一条通道**——务必让本机 `.\arm.ps1 grab-bg` 也一起跑。
+- 想更密：把 `cron` 改成 `'*/5 * * * *'`（5 分钟一轮），job 内部连续跑 13 分钟，
+  并发组 `arm-grab` 会防止重叠。**注意**：调密 cron 并不能让 GitHub 更快触发，
+  真正的提升来自本地轮询 + 拉长单轮窗口。
+- **单轮窗口**：`timeout 780s` ÷ `RETRY_INTERVAL 120s` ≈ 每轮 6~7 次 launch 尝试
+  （`timeout-minutes: 20` 留够了扩卷/通知的余量）。
 - **分钟数**：私有仓库每月 2000 分钟，15 分钟一轮 ≈ 每月 ~1000 分钟，够用但占一半；
-  **公开仓库的 GitHub-hosted Linux runner 不计分钟数**（本仓库当前就是公开模式）。
-  想省：把单次 `timeout 600s` 调小（比如 240s）。
+  **公开仓库的 GitHub-hosted Linux runner 不计分钟数**（本仓库当前就是公开模式），
+  所以拉长 `timeout` 不增加费用。想省：把单次 `timeout 780s` 调小（比如 240s）。
 - GitHub runner 出口 IP 是微软 Azure 段的（美国），API 调用没问题；真正建实例也是
   在你自己 tenancy 里，不受影响。
 - **本机也在跑同一条轮询**（`.\arm.ps1 grab-bg`）时，两个轮询器会一起打
