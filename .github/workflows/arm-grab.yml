@@ -18,9 +18,10 @@ concurrency:
 jobs:
   grab:
     runs-on: ubuntu-latest
-    # 780s 抓取窗口 + 装 CLI/扩卷/通知的余量 ≈ 850s，所以上限给到 20 分钟。
+    # 780s 抓取窗口 + 错峰偏移(≤180s) + 装 CLI/扩卷/通知的余量 ≈ 1150s；
+    # 缓存未命中时 pip install oci-cli 还要再花 1~3 分钟，所以上限给到 25 分钟。
     # 公开仓库的 hosted runner 不计分钟数，放宽不会增加费用。
-    timeout-minutes: 20
+    timeout-minutes: 25
     env:
       COMPARTMENT_ID: ${{ vars.COMPARTMENT_ID || secrets.COMPARTMENT_ID }}
       AVAILABILITY_DOMAIN: ${{ vars.AVAILABILITY_DOMAIN || secrets.AVAILABILITY_DOMAIN }}
@@ -152,6 +153,23 @@ jobs:
           RETRY_INTERVAL="${RETRY_INTERVAL:-120}"
           EOF
           chmod +x oci-arm-catcher.sh
+          # ── 错峰：开打前先随机偏移，避开本机 grab-bg 的 LaunchInstance 相位 ──
+          # 实测（run #45，2026-10-28）：本机 grab-bg（120s）与 GitHub（120s）几乎同相
+          # 同时打 LaunchInstance，7 次尝试全部被 Oracle 判成
+          #   TooManyRequests: Too many requests for the user
+          # 也就是整轮 780s 一次真实容量探测都没打到（本地单独跑时是正常的
+          # Out of host capacity，说明被限的是叠加出来的突发相位，不是总请求数）。
+          # 所以这里不降频，只把 GitHub 这条通道的相位随机挪开：偏移量在
+          # [0, RETRY_INTERVAL) 上均匀取值，正好覆盖本机的整个轮询周期。
+          # sleep 放在 timeout 之前，780s 抓取窗口不被吃掉，只多花 ≤180s 总时长。
+          RI="${RETRY_INTERVAL:-120}"
+          case "$RI" in (''|*[!0-9]*) RI=120 ;; esac
+          JITTER=$RI
+          [ "$JITTER" -gt 180 ] && JITTER=180
+          [ "$JITTER" -lt 1 ] && JITTER=1   # 防 RETRY_INTERVAL=0 时 RANDOM % 0 除零
+          OFFSET=$(( RANDOM % JITTER ))
+          echo "错峰偏移 ${OFFSET}s（本机 grab-bg 也在打 LaunchInstance，避免同相触发 429）"
+          sleep "$OFFSET"
           # 关键：GitHub 在 Linux 上默认用 `bash -e` 跑 run 块。timeout 到点发 SIGTERM
           # 会让脚本以 143 退出，-e 会当场终止步骤（表现为 "Process completed with exit code 143"），
           # 所以这里必须先 set +e，自己判断退出码。
