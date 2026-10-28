@@ -164,10 +164,26 @@ Actions → *oci-arm-grab* → **Run workflow**。看日志：
 - GitHub runner 出口 IP 是微软 Azure 段的（美国），API 调用没问题；真正建实例也是
   在你自己 tenancy 里，不受影响。
 - **本机也在跑同一条轮询**（`.\arm.ps1 grab-bg`）时，两个轮询器会一起打
-  `LaunchInstance`，偶尔撞 `TooManyRequests`（可重试，不影响）；想避免就只留一条。
+  `LaunchInstance` 并撞 `TooManyRequests`。**不是「偶尔、不影响」**——实测有过一整轮
+  7 次尝试全被限流废掉（见下面 #45/#46 对照数据）。429 属于 retryable，轮询不会断，
+  但被限的那条通道当轮等于白跑。
 - **自检小坑**：`$GITHUB_PATH` 只对后续步骤生效，当前步骤里 `oci` 不在 PATH，
   必须用绝对路径 `"$HOME/oci-venv/bin/oci"`；`bash -e` 下 `timeout` 返回 143
   会被当成失败，脚本里已用 `set +e` + 自己判退出码解决。
+- **两条通道并发时会被 Oracle 限流（已知行为，不是 bug）**。两个轮询器同时打
+  `LaunchInstance` 会触发 `TooManyRequests: Too many requests for the user`，
+  实测代价是其中一条通道的尝试整段作废：
+
+  | 轮次 | 配置 | GitHub 有效探测 | 本地有效探测 |
+  |---|---|---|---|
+  | #45 | 无错峰偏移 | **0/7 全被 429** | 6/6 正常 |
+  | #46 | 随机偏移 31s | **7/7 正常** | 1/6（5 次 429） |
+
+  429 与两通道请求落在同一分钟内严格相关，#33 恢复正常、#34 又撞，说明这靠相位
+  避不干净。现在保留错峰、两条都维持 120s，**约一半尝试被 429 吃掉是预期内的**，
+  抢到实例靠的是总尝试次数够多，不是单次成功率。429 在脚本里属于 retryable，
+  会照常等 `RETRY_INTERVAL` 再打，不会中断轮询。
+  想彻底消除竞争只能降频或只留一条通道（见上一条 2026-10-28 的权衡记录）。
 - **抢机脚本已内联进本仓库**（`oci-arm-catcher.sh`，别再改成临时 clone 上游）。
   2026-10-28 踩过坑：上游 `alexpua/oci-arm-catcher` 改名为 `deeplabua/oci-arm-catcher`
   并用 Rust 重写，根目录的 `oci-arm-catcher.sh` 被挪进 `legacy/`，于是 clone 后
