@@ -33,6 +33,9 @@ jobs:
       BOOT_VOLUME_VPUS_PER_GB: ${{ vars.BOOT_VOLUME_VPUS_PER_GB || secrets.BOOT_VOLUME_VPUS_PER_GB }}
       RETRY_INTERVAL: ${{ vars.RETRY_INTERVAL || secrets.RETRY_INTERVAL }}
     steps:
+      - name: 检出本仓库（取内联的 oci-arm-catcher.sh）
+        uses: actions/checkout@v4
+
       - name: 缓存 oci-cli 虚拟环境（省 Actions 分钟数）
         uses: actions/cache@v6
         with:
@@ -115,8 +118,28 @@ jobs:
           for v in COMPARTMENT_ID AVAILABILITY_DOMAIN SUBNET_ID IMAGE_ID; do
             [ -n "${!v:-}" ] || { echo "!! $v 是空的 → 检查仓库 Settings → Actions → Variables/Secrets"; exit 1; }
           done
-          git clone --depth 1 https://github.com/alexpua/oci-arm-catcher "$RUNNER_TEMP/catcher"
-          cd "$RUNNER_TEMP/catcher"
+          # 脚本已内联进本仓库（oci-arm-catcher.sh），不再依赖上游目录结构。
+          # 原因：上游 alexpua/oci-arm-catcher 已于 2026-10-27 改名为 deeplabua/ 并用
+          # Rust 重写，根目录的 oci-arm-catcher.sh 被挪进 legacy/，临时 clone 找不到
+          # 文件，直接在 chmod 那步炸（chmod: cannot access 'oci-arm-catcher.sh'）。
+          WORK="$RUNNER_TEMP/catcher"
+          mkdir -p "$WORK"
+          if [ -f "$GITHUB_WORKSPACE/oci-arm-catcher.sh" ]; then
+            echo "使用仓库内联的 oci-arm-catcher.sh"
+            cp "$GITHUB_WORKSPACE/oci-arm-catcher.sh" "$WORK/oci-arm-catcher.sh"
+          else
+            echo "!! 仓库内没有内联脚本，回落到 clone 上游（先试 legacy/，再试根目录）"
+            git clone --depth 1 https://github.com/deeplabua/oci-arm-catcher "$WORK/src"
+            if [ -f "$WORK/src/legacy/oci-arm-catcher.sh" ]; then
+              cp "$WORK/src/legacy/oci-arm-catcher.sh" "$WORK/oci-arm-catcher.sh"
+            else
+              cp "$WORK/src/oci-arm-catcher.sh" "$WORK/oci-arm-catcher.sh"
+            fi
+          fi
+          cd "$WORK"
+          # 兜底清洗 CRLF：万一某次 checkout/clone 把行尾转成 \r，bash 会把 \r 当字符
+          # 导致 "command not found"，这里无条件规范化一次。
+          sed -i 's/\r$//' oci-arm-catcher.sh
           cat > .env <<EOF
           COMPARTMENT_ID="$COMPARTMENT_ID"
           DISPLAY_NAME="${DISPLAY_NAME:-arm-free-1}"

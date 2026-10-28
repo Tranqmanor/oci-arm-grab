@@ -1,0 +1,6 @@
+# GitHub Actions 的 runner 是 Linux。shell 脚本必须以 LF 入库，
+# 否则 bash 会把行尾的 \r 当字符，报 "command not found" / 语法错误。
+# 本机 core.autocrlf 会在 checkout 时把 .sh 转成 CRLF，这里强制覆盖。
+*.sh   text eol=lf
+*.yml  text eol=lf
+*.json text eol=lf

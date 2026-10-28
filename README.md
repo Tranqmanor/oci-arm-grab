@@ -168,6 +168,14 @@ Actions → *oci-arm-grab* → **Run workflow**。看日志：
 - **自检小坑**：`$GITHUB_PATH` 只对后续步骤生效，当前步骤里 `oci` 不在 PATH，
   必须用绝对路径 `"$HOME/oci-venv/bin/oci"`；`bash -e` 下 `timeout` 返回 143
   会被当成失败，脚本里已用 `set +e` + 自己判退出码解决。
+- **抢机脚本已内联进本仓库**（`oci-arm-catcher.sh`，别再改成临时 clone 上游）。
+  2026-10-28 踩过坑：上游 `alexpua/oci-arm-catcher` 改名为 `deeplabua/oci-arm-catcher`
+  并用 Rust 重写，根目录的 `oci-arm-catcher.sh` 被挪进 `legacy/`，于是 clone 后
+  `chmod +x oci-arm-catcher.sh` 直接 `No such file or directory`，整轮 job 变红。
+  内联版本来自上游 `legacy/oci-arm-catcher.sh`（blob sha `3df6956`，14223 字节，LF），
+  退出码语义不变（0=抢到 / 124·143=超时继续等 / 其它=真错误），必填键集合不变，
+  所以 `.env` 无需改动。仓库里的 `.gitattributes` 强制 `*.sh` 以 LF 入库——
+  Windows 上 `core.autocrlf` 会把 `.sh` 转成 CRLF，那样 bash 会因行尾 `\r` 报错。
 
 ## 7. 不想用 GitHub 的另外两条路
 
